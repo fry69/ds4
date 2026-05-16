@@ -1,0 +1,23 @@
+Run: 20260516-2 (17:00 start, 92 evals)
+
+Command: time ./ds4-eval -m ds4flash.gguf --trace ./tmp/eval/ds4-eval-20260516-2.txt
+
+Trace file: ds4-eval-20260516-2.txt
+
+Commit ID: 613e9b2c9b78c09ac9f622bb8ece81c99989ead6
+
+Fans manually set to 5200/5500 rpm
+
+---
+
+ds4-eval: 76/92 passed, 16 failed, runtime 04h:54m
+
+Time: 04h:54m 294m 17,640s
+
+real 336m14.812s (computer sleep ~40m)
+user 9m58.312s
+sys 2m3.718s
+
+Total generated tokens: 560,009
+
+Token/s: 31.75

@@ -1,0 +1,19 @@
+Run: 20260515
+
+Commit ID for build: 336fbd6d9a0178df112ca5de20c3661be86484b3
+
+Model file: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+
+SHA1: 602b8ffd09104b7aab674cee93fb563d69367a28
+
+Automatic fan control
+
+---
+
+ds4-eval: 56/75 passed, 19 failed, runtime 05h:14m
+
+Time: 5h14m 314m 18,900s 
+
+Total generated tokens: 546,481
+
+Token/s: 28.91 (rough overal estimate, total time divided by total gen tok -> including prefill and all other overhead)
