@@ -5743,6 +5743,7 @@ static void agent_format_ctx_size(int ctx_size, char *buf, size_t len);
 #define AGENT_STATUS_STYLE_END "\x1b[0m"
 #define AGENT_STATUS_BAR_FILL "\x1b[1;95m"
 #define AGENT_QUEUE_STYLE "\x1b[1;36m"
+#define AGENT_STATUS_REDRAW_INTERVAL_SEC 0.20
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     (void)st;
@@ -5949,6 +5950,7 @@ typedef struct {
     int reserved_rows;
     bool output_cursor_saved;
     bool output_at_scroll_boundary;
+    double last_prompt_redraw_time;
     char cpr_buf[32];
     size_t cpr_len;
     bool paste_open;
@@ -6609,6 +6611,17 @@ static void editor_redraw_visible_prompt(agent_editor *ed) {
     editor_move_to_prompt_row(ed);
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     linenoiseShow(&ed->edit);
+    ed->last_prompt_redraw_time = now_sec();
+}
+
+static bool editor_prompt_redraw_due(agent_editor *ed) {
+    double now = now_sec();
+    if (ed->last_prompt_redraw_time <= 0.0 ||
+        now - ed->last_prompt_redraw_time >= AGENT_STATUS_REDRAW_INTERVAL_SEC)
+    {
+        return true;
+    }
+    return false;
 }
 
 static void editor_write_scroll_output_preserve_prompt(agent_editor *ed,
@@ -6643,8 +6656,11 @@ static void editor_write_async(agent_editor *ed, const char *text, size_t len,
         editor_write_scroll_output_preserve_prompt(ed, text, len);
         if (prompt_changed) editor_update_prompt(ed, prompt);
         if (status_changed) editor_update_status(ed, status);
-        if (force_show && (prompt_changed || status_changed))
+        if ((force_show || editor_prompt_redraw_due(ed)) &&
+            (prompt_changed || status_changed))
+        {
             editor_redraw_visible_prompt(ed);
+        }
         return;
     }
 
