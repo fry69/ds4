@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_kvstore.h"
+#include "ds4_llguidance.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -402,6 +403,392 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
+typedef enum {
+    DS4_TEXT_FORMAT_TEXT,
+    DS4_TEXT_FORMAT_JSON_OBJECT,
+    DS4_TEXT_FORMAT_JSON_SCHEMA,
+} ds4_text_format_type;
+
+typedef struct {
+    ds4_text_format_type type;
+    char *name;
+    char *schema_json;
+    bool strict;
+} ds4_text_format;
+
+static void ds4_text_format_clear(ds4_text_format *f) {
+    if (!f) return;
+    free(f->name);
+    free(f->schema_json);
+    memset(f, 0, sizeof(*f));
+}
+
+static bool ds4_text_format_is_json(const ds4_text_format *f) {
+    return f && (f->type == DS4_TEXT_FORMAT_JSON_OBJECT ||
+                 f->type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+}
+
+static void ds4_text_format_set_schema(ds4_text_format *f,
+                                       ds4_text_format_type type,
+                                       char *name,
+                                       char *schema_json,
+                                       bool strict) {
+    ds4_text_format_clear(f);
+    f->type = type;
+    f->name = name;
+    f->schema_json = schema_json;
+    f->strict = strict;
+}
+
+static const char *ds4_text_format_constraint_type(const ds4_text_format *f) {
+    if (!f) return "text";
+    if (f->type == DS4_TEXT_FORMAT_JSON_SCHEMA) return "json_schema";
+    if (f->type == DS4_TEXT_FORMAT_JSON_OBJECT) {
+        return f->schema_json ? "json_schema" : "json_object";
+    }
+    return "text";
+}
+
+static const char *ds4_text_format_constraint_data(const ds4_text_format *f) {
+    return f && f->schema_json ? f->schema_json : "";
+}
+
+static bool ds4_text_format_validate_with_llguidance(ds4_engine *e,
+                                                     const ds4_text_format *f,
+                                                     char *err,
+                                                     size_t errlen) {
+    if (!ds4_text_format_is_json(f)) return true;
+    if (!ds4_llguidance_available()) {
+        snprintf(err, errlen,
+                 "structured outputs require building ds4 with LLGUIDANCE=1");
+        return false;
+    }
+
+    char llg_err[160] = {0};
+    ds4_llguidance *g = ds4_llguidance_create(
+        e,
+        ds4_text_format_constraint_type(f),
+        ds4_text_format_constraint_data(f),
+        llg_err,
+        sizeof(llg_err));
+    if (!g) {
+        snprintf(err, errlen, "invalid structured output schema: %s",
+                 llg_err[0] ? llg_err : "llguidance rejected constraint");
+        return false;
+    }
+    ds4_llguidance_free(g);
+    return true;
+}
+
+static bool parse_json_schema_wrapper(const char **p,
+                                      ds4_text_format *format,
+                                      char *err,
+                                      size_t errlen) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    char *name = NULL;
+    char *schema = NULL;
+    bool strict = false;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "schema")) {
+            free(schema);
+            if (!json_raw_value(p, &schema)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "strict")) {
+            if (!json_bool(p, &strict)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+    if (!schema) {
+        snprintf(err, errlen, "json_schema.schema is required");
+        free(name);
+        return false;
+    }
+    ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
+                               name, schema, strict);
+    return true;
+bad:
+    free(name);
+    free(schema);
+    return false;
+}
+
+static bool parse_chat_response_format(const char **p,
+                                       ds4_text_format *format,
+                                       char *err,
+                                       size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(format);
+        return true;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+
+    char *type = NULL;
+    char *schema = NULL;
+    char *name = NULL;
+    bool strict = false;
+    bool saw_json_schema = false;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(p, &type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "json_schema")) {
+            saw_json_schema = true;
+            if (!parse_json_schema_wrapper(p, format, err, errlen)) {
+                free(key);
+                goto bad_keep_err;
+            }
+        } else if (!strcmp(key, "schema")) {
+            free(schema);
+            if (!json_raw_value(p, &schema)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "strict")) {
+            if (!json_bool(p, &strict)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (!type || !strcmp(type, "text")) {
+        ds4_text_format_clear(format);
+    } else if (!strcmp(type, "json_object")) {
+        if (schema) {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
+                                       name, schema, strict);
+            name = NULL;
+            schema = NULL;
+        } else {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
+                                       NULL, NULL, false);
+        }
+    } else if (!strcmp(type, "json_schema")) {
+        if (!saw_json_schema && schema) {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
+                                       name, schema, strict);
+            name = NULL;
+            schema = NULL;
+        } else if (!format->schema_json) {
+            snprintf(err, errlen, "response_format json_schema.schema is required");
+            goto bad_keep_err;
+        }
+    } else {
+        snprintf(err, errlen, "response_format.type=%s not supported", type);
+        goto bad_keep_err;
+    }
+
+    free(type);
+    free(name);
+    free(schema);
+    return true;
+bad:
+    snprintf(err, errlen, "invalid response_format");
+bad_keep_err:
+    free(type);
+    free(name);
+    free(schema);
+    return false;
+}
+
+static bool parse_responses_text_format_object(const char **p,
+                                               ds4_text_format *format,
+                                               char *err,
+                                               size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(format);
+        return true;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+    char *type = NULL;
+    char *name = NULL;
+    char *schema = NULL;
+    bool strict = false;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            if (!json_string(p, &type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "name")) {
+            free(name);
+            if (!json_string(p, &name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "schema")) {
+            free(schema);
+            if (!json_raw_value(p, &schema)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "strict")) {
+            if (!json_bool(p, &strict)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (!type || !strcmp(type, "text")) {
+        ds4_text_format_clear(format);
+    } else if (!strcmp(type, "json_object")) {
+        if (schema) {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
+                                       name, schema, strict);
+            name = NULL;
+            schema = NULL;
+        } else {
+            ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_OBJECT,
+                                       NULL, NULL, false);
+        }
+    } else if (!strcmp(type, "json_schema")) {
+        if (!schema) {
+            snprintf(err, errlen, "text.format.schema is required");
+            goto bad_keep_err;
+        }
+        ds4_text_format_set_schema(format, DS4_TEXT_FORMAT_JSON_SCHEMA,
+                                   name, schema, strict);
+        name = NULL;
+        schema = NULL;
+    } else {
+        snprintf(err, errlen, "text.format.type=%s not supported", type);
+        goto bad_keep_err;
+    }
+
+    free(type);
+    free(name);
+    free(schema);
+    return true;
+bad:
+    snprintf(err, errlen, "invalid text.format");
+bad_keep_err:
+    free(type);
+    free(name);
+    free(schema);
+    return false;
+}
+
+static bool parse_responses_text_value(const char **p,
+                                       ds4_text_format *format,
+                                       char *err,
+                                       size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        ds4_text_format_clear(format);
+        return true;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "format")) {
+            if (!parse_responses_text_format_object(p, format, err, errlen)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 static bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
@@ -601,6 +988,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    ds4_text_format text_format;
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -763,6 +1151,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    ds4_text_format_clear(&r->text_format);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -2726,6 +3115,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_chat_response_format(&p, &r->text_format, err, errlen)) {
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                if (!err[0]) snprintf(err, errlen, "invalid response_format");
+                request_free(r);
+                return false;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -2766,6 +3164,25 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (ds4_text_format_is_json(&r->text_format)) {
+        if (r->has_tools) {
+            snprintf(err, errlen,
+                     "structured outputs with tools are not supported");
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        if (!ds4_text_format_validate_with_llguidance(e, &r->text_format,
+                                                      err, errlen)) {
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        thinking_enabled = false;
+        got_thinking = true;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -3815,6 +4232,17 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "text")) {
+            if (!parse_responses_text_value(&p, &r->text_format, err, errlen)) {
+                free(key);
+                chat_msgs_free(&msgs);
+                buf_free(&loaded_tool_schemas);
+                free(instructions);
+                free(tool_schemas);
+                if (!err[0]) snprintf(err, errlen, "invalid text");
+                request_free(r);
+                return false;
+            }
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -3904,6 +4332,32 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    if (ds4_text_format_is_json(&r->text_format)) {
+        if (r->has_tools) {
+            snprintf(err, errlen,
+                     "structured outputs with tools are not supported");
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        if (!ds4_text_format_validate_with_llguidance(e, &r->text_format,
+                                                      err, errlen)) {
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        thinking_enabled = false;
+        got_thinking = true;
+        r->reasoning_summary_emit = false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -5964,6 +6418,10 @@ static bool request_uses_structured_stream(const request *r) {
     return r->stream && (r->api == API_ANTHROPIC ||
                          r->api == API_RESPONSES ||
                          request_uses_openai_live_stream(r));
+}
+
+static bool request_uses_structured_decoder(const request *r) {
+    return r && r->kind == REQ_CHAT && ds4_text_format_is_json(&r->text_format);
 }
 
 /* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
@@ -9907,6 +10365,7 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
+    ds4_llguidance *structured = NULL;
     const int old_pos = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -10064,6 +10523,25 @@ static void generate_job(server *s, job *j) {
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
+    if (request_uses_structured_decoder(&j->req)) {
+        structured = ds4_llguidance_create(
+            s->engine,
+            ds4_text_format_constraint_type(&j->req.text_format),
+            ds4_text_format_constraint_data(&j->req.text_format),
+            err,
+            sizeof(err));
+        if (!structured) {
+            ds4_tokens_free(&effective_prompt);
+            free(disk_cache_path);
+            trace_event(s, trace_id, "structured output init failed: %s",
+                        err[0] ? err : "unknown error");
+            http_error(j->fd, s->enable_cors, 400,
+                       err[0] ? err : "structured output init failed");
+            return;
+        }
+        trace_event(s, trace_id, "structured output constraint=%s",
+                    ds4_text_format_constraint_type(&j->req.text_format));
+    }
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
@@ -10149,6 +10627,7 @@ static void generate_job(server *s, job *j) {
                                                   cold_store_len);
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
+            ds4_llguidance_free(structured);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -10172,6 +10651,7 @@ static void generate_job(server *s, job *j) {
                                               cold_store_len);
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
+        ds4_llguidance_free(structured);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -10222,6 +10702,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            ds4_llguidance_free(structured);
             return;
         }
         /* The prefill progress callback may have already sent the SSE headers
@@ -10235,6 +10716,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            ds4_llguidance_free(structured);
             return;
         }
         progress.headers_sent = true;
@@ -10243,12 +10725,14 @@ static void generate_job(server *s, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            ds4_llguidance_free(structured);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            ds4_llguidance_free(structured);
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
@@ -10263,6 +10747,7 @@ static void generate_job(server *s, job *j) {
                            req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
+                ds4_llguidance_free(structured);
                 return;
             }
         }
@@ -10320,7 +10805,15 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        int token = structured ?
+            ds4_llguidance_sample(structured, s->session,
+                                  temperature, top_k, top_p, min_p,
+                                  &rng, err, sizeof(err)) :
+            ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (token < 0) {
+            finish = "error";
+            break;
+        }
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -10328,7 +10821,8 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (!structured &&
+            temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -10358,6 +10852,13 @@ decode_again:
             token = toks[ti];
             if (token == ds4_token_eos(s->engine)) {
                 finish = "stop";
+                stop_decode = true;
+                break;
+            }
+            if (structured &&
+                !ds4_llguidance_accept(structured, s->engine, token,
+                                       err, sizeof(err))) {
+                finish = "error";
                 stop_decode = true;
                 break;
             }
@@ -10916,6 +11417,7 @@ decode_again:
     anthropic_stream_free(&anthropic_live);
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
+    ds4_llguidance_free(structured);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }
@@ -11766,6 +12268,116 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static void test_parse_chat_response_format_json_schema(void) {
+    const char *json =
+        "{\"type\":\"json_schema\",\"json_schema\":{"
+        "\"name\":\"calendar_event\",\"strict\":true,"
+        "\"schema\":{\"type\":\"object\",\"properties\":{"
+        "\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],"
+        "\"additionalProperties\":false}}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+    TEST_ASSERT(fmt.name && !strcmp(fmt.name, "calendar_event"));
+    TEST_ASSERT(fmt.strict);
+    TEST_ASSERT(fmt.schema_json && strstr(fmt.schema_json, "\"additionalProperties\""));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_chat_response_format_json_object(void) {
+    const char *json = "{\"type\":\"json_object\"}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(fmt.schema_json == NULL);
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_object"));
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_chat_response_format_rejects_missing_schema(void) {
+    const char *json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"bad\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(!parse_chat_response_format(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "schema is required") != NULL);
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_json_schema(void) {
+    const char *json =
+        "{\"format\":{\"type\":\"json_schema\","
+        "\"name\":\"calendar_event\",\"strict\":true,"
+        "\"schema\":{\"type\":\"object\",\"properties\":{"
+        "\"date\":{\"type\":\"string\"}},\"required\":[\"date\"],"
+        "\"additionalProperties\":false}}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_SCHEMA);
+    TEST_ASSERT(fmt.name && !strcmp(fmt.name, "calendar_event"));
+    TEST_ASSERT(fmt.strict);
+    TEST_ASSERT(fmt.schema_json && strstr(fmt.schema_json, "\"required\""));
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_schema"));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_json_object(void) {
+    const char *json = "{\"format\":{\"type\":\"json_object\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(fmt.schema_json == NULL);
+    TEST_ASSERT(!strcmp(ds4_text_format_constraint_type(&fmt), "json_object"));
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_rejects_unknown_type(void) {
+    const char *json = "{\"format\":{\"type\":\"xml\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(!parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+
+    ds4_text_format_clear(&fmt);
+}
+
+static void test_parse_responses_text_format_text_is_noop(void) {
+    const char *json = "{\"format\":{\"type\":\"text\"}}";
+    const char *p = json;
+    ds4_text_format fmt = {0};
+    char err[160] = {0};
+
+    TEST_ASSERT(parse_responses_text_value(&p, &fmt, err, sizeof(err)));
+    TEST_ASSERT(fmt.type == DS4_TEXT_FORMAT_TEXT);
+    TEST_ASSERT(fmt.schema_json == NULL);
+
+    ds4_text_format_clear(&fmt);
+}
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
     tool_schema_orders orders = {0};
@@ -15554,6 +16166,13 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
+    test_parse_chat_response_format_json_schema();
+    test_parse_chat_response_format_json_object();
+    test_parse_chat_response_format_rejects_missing_schema();
+    test_parse_responses_text_format_json_schema();
+    test_parse_responses_text_format_json_object();
+    test_parse_responses_text_format_rejects_unknown_type();
+    test_parse_responses_text_format_text_is_noop();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();

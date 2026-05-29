@@ -635,9 +635,22 @@ tool calls are mapped back to OpenAI tool calls.
 
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
 `tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
-and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
-Responses continuations bound to live state when possible, and can fall back to
-the same DSML rendering and KV prefix reuse used by chat completions.
+`text.format`, and `reasoning`. It is the preferred endpoint for Codex CLI.
+The server keeps Responses continuations bound to live state when possible, and
+can fall back to the same DSML rendering and KV prefix reuse used by chat
+completions.
+
+Structured outputs are available when the server is built with llguidance:
+
+```sh
+make LLGUIDANCE=1
+```
+
+With that build, `/v1/chat/completions` supports
+`response_format.type=json_schema` and `response_format.type=json_object`;
+`/v1/responses` supports the same modes through `text.format`. Structured
+outputs use constrained decoding, disable thinking for that turn, and currently
+cannot be combined with tools.
 
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
@@ -1133,6 +1146,7 @@ extractor self-test run first:
 make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
+python3 tests/structured_outputs_stress.py --base-url http://127.0.0.1:8000/v1 --model ds4 --apis chat,responses
 ```
 
 ## Debugging Notes

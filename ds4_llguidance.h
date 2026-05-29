@@ -1,0 +1,37 @@
+#ifndef DS4_LLGUIDANCE_H
+#define DS4_LLGUIDANCE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "ds4.h"
+
+typedef struct ds4_llguidance ds4_llguidance;
+
+bool ds4_llguidance_available(void);
+const char *ds4_llguidance_build_info(void);
+
+ds4_llguidance *ds4_llguidance_create(ds4_engine *e,
+                                      const char *constraint_type,
+                                      const char *constraint_data,
+                                      char *err,
+                                      size_t errlen);
+void ds4_llguidance_free(ds4_llguidance *g);
+
+int ds4_llguidance_sample(ds4_llguidance *g,
+                          ds4_session *s,
+                          float temperature,
+                          int top_k,
+                          float top_p,
+                          float min_p,
+                          uint64_t *rng,
+                          char *err,
+                          size_t errlen);
+bool ds4_llguidance_accept(ds4_llguidance *g,
+                           ds4_engine *e,
+                           int token,
+                           char *err,
+                           size_t errlen);
+
+#endif
