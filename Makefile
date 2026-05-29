@@ -58,7 +58,7 @@ CUDA_LDLIBS += $(LLGUIDANCE_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean distclean test cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -241,3 +241,6 @@ test: ds4_test ds4-eval
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+distclean: clean
+	rm -rf .deps
